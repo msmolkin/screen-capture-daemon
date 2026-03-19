@@ -29,6 +29,14 @@ else
   fi
 fi
 
+# Function to check if an mp4 is valid (not 0-byte or corrupted)
+is_valid_mp4() {
+  local file="$1"
+  if [ ! -s "$file" ]; then return 1; fi
+  # Fast check with ffprobe for moov atom/headers
+  ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1 "$file" >/dev/null 2>&1
+}
+
 for SCREEN in $SCREENS; do
   if [ "$SCREEN" = "all" ]; then
     PATTERN="capture-*.mp4"
@@ -38,24 +46,37 @@ for SCREEN in $SCREENS; do
     OUTPUT="$CAPTURE_DIR/${DATE}-${SCREEN}-full.mp4"
   fi
 
-  SEGMENTS=$(find "$DAY_DIR" -name "$PATTERN" -type f | sort | wc -l | tr -d ' ')
-  if [ "$SEGMENTS" -eq 0 ]; then
-    echo "No segments for $SCREEN on $DATE"
+  # Find all potential segments
+  ALL_SEGMENTS=$(find "$DAY_DIR" -name "$PATTERN" -type f | sort)
+  
+  # Filter out corrupted segments automatically
+  VALID_SEGMENTS=()
+  for f in $ALL_SEGMENTS; do
+    if is_valid_mp4 "$f" ; then
+      VALID_SEGMENTS+=("$f")
+    else
+      echo "[$SCREEN] WARNING: Skipping corrupted or empty segment: $(basename "$f")"
+    fi
+  done
+
+  SEGMENT_COUNT=${#VALID_SEGMENTS[@]}
+  if [ "$SEGMENT_COUNT" -eq 0 ]; then
+    echo "[$SCREEN] No valid segments for $SCREEN on $DATE"
     continue
   fi
 
-  if [ "$SEGMENTS" -eq 1 ]; then
-    cp "$DAY_DIR"/$PATTERN "$OUTPUT"
+  if [ "$SEGMENT_COUNT" -eq 1 ]; then
+    cp "${VALID_SEGMENTS[0]}" "$OUTPUT"
     echo "[$SCREEN] Single segment copied to $OUTPUT"
   else
     CONCAT_LIST="$DAY_DIR/concat-${SCREEN}.txt"
-    find "$DAY_DIR" -name "$PATTERN" -type f | sort | while read -r f; do
+    for f in "${VALID_SEGMENTS[@]}"; do
       echo "file '$f'"
     done > "$CONCAT_LIST"
 
     ffmpeg -f concat -safe 0 -i "$CONCAT_LIST" -c copy -y "$OUTPUT"
     rm "$CONCAT_LIST"
-    echo "[$SCREEN] Stitched $SEGMENTS segments into $OUTPUT"
+    echo "[$SCREEN] Stitched $SEGMENT_COUNT segments into $OUTPUT"
   fi
 
   SIZE=$(du -h "$OUTPUT" | cut -f1)

@@ -1,6 +1,8 @@
 # Screen Capture Daemon for macOS
 
-A lightweight, automated background screen capture system for macOS that records all connected displays at configurable frame rates and automatically stitches segments into daily videos.
+A lightweight, automated background screen capture system for macOS that records all connected displays at configurable frame rates and automatically stitches segments into daily videos. 
+
+**Part of a recording suite:** Best used alongside the [Webcam Capture Daemon](https://github.com/msmolkin/webcam-capture-daemon) for a complete visual log of your activity.
 
 This tool is designed to be a "set and forget" alternative to manual OBS recording, handling display changes, system sleep/wake, and daily rotations automatically.
 
@@ -49,7 +51,7 @@ SECONDARY_FPS=1/3
 
 **This is the most important step.** Before loading the background service, you **must** run the script once manually in your terminal to trigger a specific macOS security prompt that doesn't appear when running as a LaunchAgent.
 
-1.  **Ensure general permissions:** Go to **System Settings > Privacy & Security > Screen Recording** and make sure your terminal (e.g., **Terminal**, **iTerm2**) and **bash** are toggled **ON** (not certain whether this is necessary).
+1.  **Ensure general permissions:** Go to **System Settings > Privacy & Security > Screen Recording** and make sure your terminal (e.g., **Terminal**, **iTerm2**) and **bash** are toggled **ON**.
 2.  **Run the script:**
     ```bash
     /usr/local/bin/screen-capture-daemon.sh
@@ -89,7 +91,7 @@ launchctl load -w ~/Library/LaunchAgents/com.michaelcli.screen-capture.plist
 If the daemon is running but creating empty files, double-check that **Terminal**, **bash**, and/or **iTerm2** are toggled **ON** in:
 - **System Settings > Privacy & Security > Screen Recording**
 
-Note: If **bash** does not appear in the list, or you never saw the "Bypass" prompt, running the script manually (Step 4) should trigger its appearance. You may need to restart the daemon for permissions to take effect:
+Note: If **bash** does not appear in the list, or you never saw the "Bypass" prompt, running the script manually (Step 4) should trigger its appearance in the list or the prompt to appear. You may need to restart the daemon for permissions to take effect:
 ```bash
 launchctl stop com.michaelcli.screen-capture
 launchctl start com.michaelcli.screen-capture
@@ -115,6 +117,16 @@ launchctl start com.michaelcli.screen-capture
   ```bash
   rmdir /tmp/screen-capture-daemon-$(id -u).lock
   ```
+
+## Companion Tool
+
+For a complete setup, check out the [Webcam Capture Daemon](https://github.com/msmolkin/webcam-capture-daemon), which records your camera at a low framerate to complement your screen recordings.
+
+## Support
+
+If you find this tool useful, consider supporting the development:
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/msmolkin)
 
 ## License
 MIT
