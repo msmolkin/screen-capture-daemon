@@ -27,6 +27,9 @@ CAPTURE_DIR="$HOME/screen-recordings"
 LOG_DIR="$CAPTURE_DIR/logs"
 mkdir -p "$LOG_DIR"
 
+# Clean up any orphaned ffmpeg processes from previous runs that might be hogging CPU
+pkill -f "ffmpeg.*avfoundation.*capture_cursor" || true
+
 # Load FPS configuration if exists
 CONFIG_FILE="$HOME/.config/screen-capture/config.env"
 if [ -f "$CONFIG_FILE" ]; then
