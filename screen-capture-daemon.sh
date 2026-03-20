@@ -141,7 +141,7 @@ while true; do
     # This is expected behavior. The capture will continue when display wakes.
     ffmpeg -f avfoundation -framerate "$FRAMERATE" -capture_cursor 1 -i "${DEVICE}:none" \
       -vf "${FPS_FILTER},scale=1920:-2" \
-      -c:v libx264 -crf 28 -preset ultrafast \
+      -c:v libx264 -crf 28 -preset ultrafast -threads 1 \
       -movflags frag_keyframe+empty_moov \
       -t "$DURATION" \
       -y "$OUTFILE" \
