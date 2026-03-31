@@ -1,48 +1,120 @@
 #!/bin/bash
-# screen-capture-daemon.sh — Captures all connected screens
+# screen-capture-daemon.sh — Captures all connected screens at 2fps
 # Re-enumerates screens on every restart, so it handles:
 #   - Screen connect/disconnect
 #   - Sleep/wake (ffmpeg dies on sleep, restarts on wake)
 #   - Midnight rotation with daily stitching
 
-# Prevent duplicate instances and handle stale lockfiles
-LOCKFILE="/tmp/screen-capture-daemon-$(id -u).lock"
-# Simple check for another running instance of this script
-# Using pgrep to find other bash processes running this specific script
-if pgrep -f "/usr/local/bin/screen-capture-daemon.sh" | grep -v "$$" > /dev/null; then
-  echo "[$(date)] Another instance of screen-capture-daemon.sh is already running. Exiting."
-  exit 0
-fi
+PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
-# If we reached here, no other daemon is running, so we can clear any stale lock
-rmdir "$LOCKFILE" 2>/dev/null
-if ! mkdir "$LOCKFILE" 2>/dev/null; then
-  # Still failed? Likely a race condition with another starting instance
-  exit 0
+# Prevent duplicate instances and clean up stale locks from crashed runs.
+LOCKDIR="/tmp/screen-capture-daemon-$(id -u).lock"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  LOCK_PID="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+  if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
+    exit 0
+  fi
+  rm -rf "$LOCKDIR"
+  if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    exit 0
+  fi
 fi
-trap 'rmdir "$LOCKFILE" 2>/dev/null' EXIT
+echo "$$" > "$LOCKDIR/pid"
+trap 'rm -rf "$LOCKDIR"' EXIT
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CAPTURE_DIR="$HOME/screen-recordings"
 LOG_DIR="$CAPTURE_DIR/logs"
 mkdir -p "$LOG_DIR"
+LOGFILE="$LOG_DIR/daemon-stdout.log"
+touch "$LOGFILE"
+exec >>"$LOGFILE" 2>&1
 
-# Clean up any orphaned ffmpeg processes from previous runs that might be hogging CPU
-pkill -f "ffmpeg.*avfoundation.*capture_cursor" || true
+FFMPEG_BIN="$(command -v ffmpeg || true)"
+if [ -z "$FFMPEG_BIN" ]; then
+  echo "[$(date)] ffmpeg not found in PATH=$PATH"
+  exit 1
+fi
 
-# Load FPS configuration if exists
 CONFIG_FILE="$HOME/.config/screen-capture/config.env"
 if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 fi
 
-# Set default FPS if not provided by config
 PRIMARY_FPS="${PRIMARY_FPS:-2}"
 SECONDARY_FPS="${SECONDARY_FPS:-1/3}"
+OUTPUT_WIDTH="${OUTPUT_WIDTH:-1280}"
+SEGMENT_SECONDS="${SEGMENT_SECONDS:-900}"
 
-echo "[$(date)] Daemon starting (PID $$) with Primary FPS: $PRIMARY_FPS, Secondary FPS: $SECONDARY_FPS"
+echo "[$(date)] Daemon starting (PID $$) with Primary FPS: $PRIMARY_FPS, Secondary FPS: $SECONDARY_FPS, Width: $OUTPUT_WIDTH, Segment Seconds: $SEGMENT_SECONDS"
+
+# Clean up orphaned capture workers from previous crashed runs for this user.
+pkill -U "$(id -u)" -f "$CAPTURE_DIR/.*/capture-screen.*\\.mp4" || true
 
 FFMPEG_PIDS=()
+
+fallback_capture_segment() {
+  local duration="$1"
+  local outfile="$2"
+  local fps="$3"
+  local tempdir
+  local frame=1
+  local interval
+  local end_time
+  local framefile
+  local retries
+  local capture_ok=0
+
+  tempdir=$(mktemp -d /tmp/screen-capture-fallback.XXXXXX)
+  interval=$(awk "BEGIN { printf \"%.3f\", 1 / $fps }")
+  end_time=$(( $(date +%s) + duration ))
+
+  echo "[$(date)] Fallback capture starting -> $(basename "$outfile") at ${fps}fps"
+
+  while [ "$(date +%s)" -lt "$end_time" ]; do
+    framefile="$tempdir/frame-$(printf '%06d' "$frame").png"
+    retries=0
+    while [ "$retries" -lt 5 ]; do
+      if screencapture -x "$framefile" >/dev/null 2>&1; then
+        capture_ok=1
+        break
+      fi
+      retries=$(( retries + 1 ))
+      sleep 1
+    done
+
+    if [ "$capture_ok" -eq 0 ]; then
+      echo "[$(date)] Fallback screencapture failed repeatedly; aborting segment."
+      rm -rf "$tempdir"
+      return 1
+    fi
+
+    frame=$(( frame + 1 ))
+    sleep "$interval"
+  done
+
+  "$FFMPEG_BIN" -nostdin -y \
+    -framerate "$fps" \
+    -pattern_type glob -i "$tempdir/frame-*.png" \
+    -vf "scale=${OUTPUT_WIDTH}:-2" \
+    -c:v libx264 -preset ultrafast \
+    "$outfile" </dev/null >> "$LOG_DIR/${DATE}.log" 2>&1
+  local status=$?
+  rm -rf "$tempdir"
+  return "$status"
+}
+
+can_screencapture() {
+  local probe
+  probe="/tmp/screen-capture-probe-$$.png"
+  if screencapture -x "$probe" >/dev/null 2>&1; then
+    rm -f "$probe"
+    return 0
+  fi
+  rm -f "$probe"
+  return 1
+}
 
 cleanup() {
   echo "[$(date)] Stopping screen capture daemon"
@@ -61,7 +133,7 @@ trap cleanup SIGTERM SIGINT
 detect_screens() {
   local tmpfile
   tmpfile=$(mktemp)
-  ( ffmpeg -f avfoundation -list_devices true -i "" 2>"$tmpfile" || true ) &
+  ( "$FFMPEG_BIN" -nostdin -f avfoundation -list_devices true -i "" </dev/null 2>"$tmpfile" || true ) &
   local pid=$!
   local waited=0
   while kill -0 "$pid" 2>/dev/null && [ $waited -lt 10 ]; do
@@ -94,8 +166,7 @@ while true; do
     SEGMENT_COUNTER=0
     echo "$DATE:1" > "$COUNTER_FILE"
   else
-    # Correctly read counter file to avoid errors
-    IFS=':' read -r COUNTER_DATE COUNTER_VAL < "$COUNTER_FILE" || true
+    IFS=: read -r COUNTER_DATE COUNTER_VAL < "$COUNTER_FILE" || true
     if [ "$COUNTER_DATE" = "$DATE" ]; then
       SEGMENT_COUNTER="$COUNTER_VAL"
     else
@@ -107,10 +178,31 @@ while true; do
   SEGMENT_COUNTER=$(( SEGMENT_COUNTER + 1 ))
   echo "$DATE:$SEGMENT_COUNTER" > "$COUNTER_FILE"
 
+  # Rotate in shorter chunks for reliability and easier recovery.
+  NOW=$(date +%s)
+  MIDNIGHT=$(date -j -f "%Y-%m-%d %H:%M:%S" "$(date -v+1d +%Y-%m-%d) 00:00:00" +%s 2>/dev/null || date -d "tomorrow 00:00" +%s)
+  SECONDS_TO_MIDNIGHT=$(( MIDNIGHT - NOW ))
+  SEGMENT_DURATION="$SECONDS_TO_MIDNIGHT"
+  if [ "$SEGMENT_SECONDS" -gt 0 ] && [ "$SECONDS_TO_MIDNIGHT" -gt "$SEGMENT_SECONDS" ]; then
+    SEGMENT_DURATION="$SEGMENT_SECONDS"
+  fi
+
   # Discover available screens
   SCREENS=$(detect_screens)
   if [ -z "$SCREENS" ]; then
-    echo "[$(date)] No screens detected. Retrying in 10s..."
+    if can_screencapture; then
+      SCREEN_COUNT=1
+      echo "[$(date)] No AVFoundation screens detected. Falling back to screencapture mode."
+      OUTFILE="$OUTPUT_DIR/capture-screen1-${TIMESTAMP}-seg${SEGMENT_COUNTER}.mp4"
+      CHUNK_DURATION="$SEGMENT_DURATION"
+      if fallback_capture_segment "$CHUNK_DURATION" "$OUTFILE" "$PRIMARY_FPS"; then
+        sleep 1
+        continue
+      fi
+      echo "[$(date)] Fallback capture failed. Retrying in 10s..."
+    else
+      echo "[$(date)] No screens detected. Retrying in 10s..."
+    fi
     sleep 10
     continue
   fi
@@ -118,12 +210,7 @@ while true; do
   SCREEN_COUNT=$(echo "$SCREENS" | wc -l | tr -d ' ')
   echo "[$(date)] Detected $SCREEN_COUNT screen(s): $(echo $SCREENS | tr '\n' ' ')"
 
-  # Calculate seconds until midnight
-  NOW=$(date +%s)
-  MIDNIGHT=$(date -j -f "%Y-%m-%d %H:%M:%S" "$(date -v+1d +%Y-%m-%d) 00:00:00" +%s 2>/dev/null || date -d "tomorrow 00:00" +%s)
-  DURATION=$(( MIDNIGHT - NOW ))
-
-  # Launch one ffmpeg per screen
+  # Launch one ffmpeg per screen.
   FFMPEG_PIDS=()
   for DEVICE in $SCREENS; do
     SCREEN_LABEL="screen${DEVICE}"
@@ -131,7 +218,7 @@ while true; do
     OUTFILE="$OUTPUT_DIR/capture-${SCREEN_LABEL}-${TIMESTAMP}-seg${SEGMENT_COUNTER}.mp4"
     echo "[$(date)] Starting capture: $SCREEN_LABEL -> $(basename "$OUTFILE")"
 
-    # Determine framerate configured via variables
+    # Determine framerate configured via variables.
     if [ "$DEVICE" = "1" ]; then
       FRAMERATE=$PRIMARY_FPS
       FPS_FILTER="fps=$PRIMARY_FPS"
@@ -142,83 +229,32 @@ while true; do
 
     # Note: If screen is off/locked, avfoundation will capture black frames.
     # This is expected behavior. The capture will continue when display wakes.
-    ffmpeg -f avfoundation -framerate "$FRAMERATE" -capture_cursor 1 -i "${DEVICE}:none" \
-      -vf "${FPS_FILTER},scale=1920:-2" \
-      -c:v libx264 -crf 28 -preset ultrafast -threads 1 \
-      -movflags frag_keyframe+empty_moov \
-      -t "$DURATION" \
+    "$FFMPEG_BIN" -nostdin -f avfoundation -pixel_format uyvy422 -framerate "$FRAMERATE" -capture_cursor 1 -i "${DEVICE}:none" \
+      -t "$SEGMENT_DURATION" \
+      -vf "${FPS_FILTER},scale=${OUTPUT_WIDTH}:-2" \
+      -c:v libx264 -preset ultrafast \
       -y "$OUTFILE" \
       </dev/null >> "$LOG_DIR/${DATE}.log" 2>&1 &
     FFMPEG_PIDS+=($!)
   done
 
-  # Wait for ANY ffmpeg to exit (screen disconnect, sleep, crash, or midnight)
-  # Also check for NEW screens connecting (poll every 10 seconds)
-  # When something changes, kill all and restart the loop to re-enumerate
-  SCREEN_CHECK_COUNTER=0
+  # Wait for any capture worker to exit, then restart the loop and re-enumerate.
   while true; do
-    # Check if any ffmpeg has exited
+    CAPTURE_EXITED=0
     for i in "${!FFMPEG_PIDS[@]}"; do
       pid="${FFMPEG_PIDS[$i]}"
       if ! kill -0 "$pid" 2>/dev/null; then
-        echo "[$(date)] ffmpeg (PID $pid) exited. Stopping all captures and re-enumerating..."
-        for p in "${FFMPEG_PIDS[@]}"; do
-          kill "$p" 2>/dev/null || true
-        done
-        wait 2>/dev/null
-        FFMPEG_PIDS=()
-        break 2
+        CAPTURE_EXITED=1
+        echo "[$(date)] ffmpeg (PID $pid) exited. Restarting capture loop..."
+        break
       fi
     done
 
-    # Every 10 seconds, check if new screens have appeared
-    SCREEN_CHECK_COUNTER=$(( SCREEN_CHECK_COUNTER + 1 ))
-    if [ $(( SCREEN_CHECK_COUNTER % 2 )) -eq 0 ]; then
-      NEW_SCREENS=$(detect_screens)
-      if [ "$NEW_SCREENS" != "$SCREENS" ]; then
-        echo "[$(date)] Screen configuration changed: was [$SCREENS] now [$NEW_SCREENS]. Re-enumerating..."
-
-        # If a screen was disconnected, stitch its recording
-        # Kill ffmpeg FIRST (before stitching) with SIGKILL fallback
-        for p in "${FFMPEG_PIDS[@]}"; do
-          kill "$p" 2>/dev/null || true
-        done
-        sleep 2
-        for p in "${FFMPEG_PIDS[@]}"; do
-          kill -9 "$p" 2>/dev/null || true
-        done
-        wait 2>/dev/null
-        FFMPEG_PIDS=()
-
-        # Then stitch disconnected screens (ffmpeg is no longer writing)
-        for OLD_SCREEN in $SCREENS; do
-          FOUND=0
-          for NEW_SCREEN in $NEW_SCREENS; do
-            if [ "$OLD_SCREEN" = "$NEW_SCREEN" ]; then
-              FOUND=1
-              break
-            fi
-          done
-          if [ $FOUND -eq 0 ]; then
-            echo "[$(date)] Screen $OLD_SCREEN disconnected. Stitching today's segments..."
-            "$SCRIPT_DIR/daily-stitch.sh" "$DATE" "screen$OLD_SCREEN" >> "$LOG_DIR/${DATE}.log" 2>&1 || true
-          fi
-        done
-
-        break
-      fi
-    fi
-
-    sleep 5
-
-    # Midnight watchdog: ffmpeg -t pauses during sleep, so force rotate at midnight
-    CURRENT_DATE=$(date +%Y-%m-%d)
-    if [ "$CURRENT_DATE" != "$DATE" ]; then
-      echo "[$(date)] Midnight crossed. Rotating..."
+    if [ "$CAPTURE_EXITED" -eq 1 ]; then
       for p in "${FFMPEG_PIDS[@]}"; do
         kill "$p" 2>/dev/null || true
       done
-      sleep 2
+      sleep 1
       for p in "${FFMPEG_PIDS[@]}"; do
         kill -9 "$p" 2>/dev/null || true
       done
@@ -226,6 +262,8 @@ while true; do
       FFMPEG_PIDS=()
       break
     fi
+
+    sleep 2
   done
 
   # Check if we crossed midnight — if so, stitch the completed day
@@ -235,6 +273,6 @@ while true; do
     "$SCRIPT_DIR/daily-stitch.sh" "$DATE" >> "$LOG_DIR/${DATE}.log" 2>&1 || true
   fi
 
-  # Brief pause before restarting (gives time for wake to fully settle)
-  sleep 3
+  # Brief pause before restarting.
+  sleep 1
 done

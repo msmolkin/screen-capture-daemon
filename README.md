@@ -47,12 +47,15 @@ PRIMARY_FPS=2
 SECONDARY_FPS=1/3
 ```
 
-### 4. First-Time Run & Critical Permission
+### 4. First-Time Run & Critical Permissions
 
-**This is the most important step.** Before loading the background service, you **must** run the script once manually in your terminal to trigger a specific macOS security prompt that doesn't appear when running as a LaunchAgent.
+**This is the most important step.** Before loading the background service, you should grant the same screen-capture permissions to the exact processes that macOS will attribute the capture request to.
 
-1.  **Ensure general permissions:** Go to **System Settings > Privacy & Security > Screen Recording** and make sure your terminal (e.g., **Terminal**, **iTerm2**) and **bash** are toggled **ON**.
-2.  **Run the script:**
+1.  **Grant Screen Recording to your terminal app** so you can do the first manual run:
+    - **Terminal** or **iTerm2**
+2.  **Grant Screen Recording to `/bin/bash`**. This matters because when the daemon runs via LaunchAgent, macOS TCC attributes the screen capture to the responsible process (`/bin/bash`), not just to `ffmpeg`.
+3.  **Optionally grant Screen Recording to `ffmpeg`** if macOS surfaces it in the list. This is not always the deciding process, but it is useful for direct manual tests.
+4.  **Run the script manually once from your terminal:**
     ```bash
     /usr/local/bin/screen-capture-daemon.sh
     ```
@@ -64,9 +67,9 @@ On newer macOS versions (Sonoma, Sequoia, and later), you will see this specific
 
 ![macOS Permissions Prompt](permissions-prompt.png)
 
-- **You must click "Allow".** 
+- **You must click "Allow".**
 - This prompt appears because the daemon records in the background without using the interactive system picker.
-- If you do not click "Allow" here, the script will only record black frames or create 0-byte files, even if the general "Screen Recording" toggle is on in System Settings.
+- If you do not click "Allow" here, the script may only record black frames, stall before first frame, or create empty files even if the general "Screen Recording" toggle is on in System Settings.
 
 Once you've clicked "Allow" and verified it's capturing (by checking `~/screen-recordings/`), press `Ctrl+C` to stop the manual run.
 
@@ -88,14 +91,29 @@ launchctl load -w ~/Library/LaunchAgents/com.michaelcli.screen-capture.plist
 
 ### 6. Verify System Settings
 
-If the daemon is running but creating empty files, double-check that **Terminal**, **bash**, and/or **iTerm2** are toggled **ON** in:
+If the daemon is running but creating empty files, stalling before first frame, or not creating output files at all, double-check that these are toggled **ON** in:
 - **System Settings > Privacy & Security > Screen Recording**
+  - **Terminal** or **iTerm2**
+  - **/bin/bash**
+  - **ffmpeg** if present
 
-Note: If **bash** does not appear in the list, or you never saw the "Bypass" prompt, running the script manually (Step 4) should trigger its appearance in the list or the prompt to appear. You may need to restart the daemon for permissions to take effect:
+Note: If `/bin/bash` does not appear in the list, or you never saw the "Bypass" prompt, running the script manually (Step 4) should trigger its appearance in the list or the prompt to appear. After changing permissions, restart the daemon:
 ```bash
 launchctl stop com.michaelcli.screen-capture
 launchctl start com.michaelcli.screen-capture
 ```
+
+### Replication Notes
+
+If you want to reproduce the working setup on another Mac, these are the changes and expectations that mattered in practice:
+
+- The LaunchAgent should run `/bin/bash /usr/local/bin/screen-capture-daemon.sh` directly in the Aqua session.
+- `/bin/bash` needs Screen Recording permission because launchd-owned background captures are attributed to `bash` by TCC.
+- `screen-capture-daemon.sh` should use non-interactive `ffmpeg` calls (`-nostdin` and `</dev/null`) so the process does not get stopped by terminal/job-control input.
+- The daemon should use a launchd-safe `PATH`, write logs to `~/screen-recordings/logs/`, and keep a real stale-lock check instead of blindly deleting the lock directory.
+- The AVFoundation input should explicitly use `-pixel_format uyvy422`.
+- Shorter rolling segments are safer than a single all-day segment because recovery is faster and failures are easier to isolate.
+- Re-enumerating AVFoundation devices while a capture is already running can destabilize the active capture, so the current script only re-enumerates on segment restart.
 
 ## How It Works
 
